@@ -1,0 +1,646 @@
+---
+title: "Expected Stats"
+author: "Sean McGarry"
+date: "2024-07-06"
+output: html_document
+---
+##Library Imports
+```{r}
+library(tidyverse)
+library(modelr)
+library(knitr)
+library(dplyr)
+library(readr)
+library(purrr)
+library(randomForest)
+library(kableExtra)
+library(htmltools)
+library(caret)
+library(ggrepel)
+```
+
+##Import Training Data
+```{r}
+setwd("~/Desktop/Wareham/Data/ExpectedStats")
+training_data23 = read_csv("Full_College_TM_2023.csv")
+training_data24 = read_csv("Full_College_TM_2024.csv")
+```
+##Data Cleaning Function
+```{r}
+process_data <- function(training_data) {
+   hit_data <- training_data %>%
+     mutate(IsHit = case_when(
+       PlayResult %in% c("Single", "Double", "Triple", "HomeRun") ~ 1,
+       KorBB == "Strikeout" ~ 0,
+       PlayResult == "Undefined" ~ NA_real_,
+       PlayResult == "Sacrifice" ~ NA_real_,
+       TRUE ~ 0
+     ))
+   
+   bases_data <- hit_data %>%
+     mutate(Bases = case_when(
+       PlayResult == "Single" ~ 1,
+       PlayResult == "Double" ~ 2,
+       PlayResult == "Triple" ~ 3,
+       PlayResult == "HomeRun" ~ 4,
+       KorBB == "Strikeout" ~ 0,
+       PlayResult == "Undefined" ~ NA_real_,
+       TRUE ~ 0
+     ))
+   
+   cleaned_data <- bases_data %>%
+     select(Batter, BatterTeam, BatterSide, Pitcher, PitcherTeam, PitcherThrows, TaggedPitchType, TaggedHitType, ExitSpeed, Angle, Bearing, 
+            KorBB, PlayResult, IsHit, Bases)
+   
+   rounded_data <- cleaned_data %>%
+     mutate(
+       ExitSpeed = round(ExitSpeed), 
+       Angle = round(Angle),
+       IsHit = factor(IsHit, levels = c(0, 1), labels = c("No", "Yes")), # Convert IsHit to factor
+       Bases = as.numeric(Bases)  # Ensure Bases is numeric
+     )
+   
+   return(rounded_data)
+}
+
+```
+
+##Run functions
+```{r}
+cleaned23 = process_data(training_data23)
+cleaned24 = process_data(training_data24)
+two_season_training_data <- bind_rows(cleaned23, cleaned24)
+
+filtered_data1 <- two_season_training_data %>% filter(!is.na(IsHit))
+filtered_data2 <- filtered_data1 %>% filter(TaggedHitType != "Undefined" & !is.na(ExitSpeed) & !is.na(Angle))
+
+strikeouts = two_season_training_data %>% filter(KorBB == "Strikeout")
+```
+
+
+##Train KNN Model
+```{r}
+train_control_classification <- trainControl(method = "cv", number = 25, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+train_control_regression <- trainControl(
+  method = "cv", 
+  number = 25
+)
+
+# Train the KNN model for IsHit (classification)
+set.seed(3)
+BAmodel <- train(IsHit ~ ExitSpeed + Angle , data = filtered_data2, method = "knn", trControl = train_control_classification, tuneLength = 10, metric = "ROC")
+
+# Train the KNN model for Bases (regression)
+set.seed(3)
+SLGmodel <- train(Bases ~ ExitSpeed + Angle , data = filtered_data2, method = "knn", trControl = train_control_regression, tuneLength = 10)
+```
+## Read in data and adjust it for modeling
+```{r}
+setwd("~/Desktop/Wareham/Data")
+df <- read_csv("all_games.csv")
+
+# Rename Murf Gray
+master <- df %>%
+  mutate(Batter = ifelse(Batter %in% c("Gray, Triston"), 
+                                  "Gray, Murf", Batter))
+
+cape_games <- process_data(master) 
+cape_filtered1 <- cape_games %>% filter(!is.na(IsHit))
+cape_filtered2 <- cape_filtered1 %>% filter(TaggedHitType != "Undefined" & !is.na(ExitSpeed) & !is.na(Angle))
+
+# Break off strikeouts to add later
+strikeouts <- cape_games %>% filter(KorBB == "Strikeout")
+
+# Predict using the KNN models
+BApredictions <- predict(BAmodel, newdata = cape_filtered2, type = "prob")
+SLGpredictions <- predict(SLGmodel, newdata = cape_filtered2)
+
+# Add predictions and residuals to the master data
+cape_data <- cape_filtered2 %>%
+  mutate(xBA = BApredictions["Yes"][,1],  # Use probability for class "1" (hit)
+         BA_minus_xBA = as.numeric(IsHit) - BApredictions["Yes"][,1],
+         xSLG = SLGpredictions,
+         SLG_minus_xSLG = Bases - xSLG)
+
+strikeouts_adj <- strikeouts %>%
+  mutate(xBA = 0, 
+         BA_minus_xBA = 0,
+         xSLG = 0,
+         SLG_minus_xSLG = 0)
+
+cape_final <- bind_rows(cape_data, strikeouts_adj)
+
+# Convert IsHit to numeric for aggregation
+cape_final_no_na <- cape_final %>%
+  mutate(IsHit = ifelse(as.character(IsHit) == "Yes", 1, 0))
+```
+## Team Name Lookup
+```{r}
+# Create the lookup vector
+team_lookup <- c(
+  "WAR_GAT" = "Wareham Gatemen",
+  "HYA_HAR" = "Hyannis Harbor Hawks",
+  "BRE_WHI" = "Brewster Whitecaps",
+  "FAL_COM" = "Falmouth Commodores",
+  "HAR_MAR" = "Harwich Mariners",
+  "COT_KET" = "Cotuit Kettleers",
+  "YAR_RED" = "Y-D Red Sox",
+  "ORL_FIR" = "Orleans Firebirds",
+  "BOU_BRA" = "Bourne Braves",
+  "CHA_ANG" = "Chatham Anglers"
+)
+```
+## HITTERS
+
+## HTML Output
+```{r}
+#roster = c("Hot, Bayram", "Summerhill, Brendan", "Gray, Murf", "Putnam, Eli", "Jimenez, Antonio", "Dessureault, Yohann",
+ #          "Earley, Nate", "Turner, Colby", "Jarrell, Jacob", "White, Sam", "Chapman, Reese", "Lippe, Michael", "Rivera, Aris")
+
+#gatemen <- cape_final %>% filter(Batter %in% roster)
+min_ab = 60
+# Group by 'Batter' and 'BatterTeam' and calculate averages
+aggregated_data <- cape_final_no_na %>%
+  group_by(Batter, BatterTeam) %>%
+  summarize(
+    IsHit = sum(IsHit, na.rm = TRUE),  # Sum IsHit, ignoring NA values
+    Bases = sum(Bases, na.rm = TRUE),  # Sum Bases, ignoring NA values
+    xBA = mean(xBA, na.rm = TRUE),  # Mean of xBA, ignoring NA values
+    BA_minus_xBA = mean(BA_minus_xBA, na.rm = TRUE),  # Mean of BA_minus_xBA, ignoring NA values
+    xSLG = mean(xSLG, na.rm = TRUE),  # Mean of xSLG, ignoring NA values
+    SLG_minus_xSLG = mean(SLG_minus_xSLG, na.rm = TRUE),  # Mean of SLG_minus_xSLG, ignoring NA values
+    AtBats = n()
+  ) %>%
+  ungroup()
+
+# Now summarize the aggregated data
+expected_stats <- aggregated_data %>%
+  group_by(Batter) %>%
+  summarize(
+    Team = first(BatterTeam),
+    `At Bats` = sum(AtBats),
+    Hits = sum(IsHit),
+    Bases = sum(Bases),
+    BA = round(sum(IsHit) / sum(AtBats), 3),
+    xBA = round(mean(xBA), 3),
+    `BA - xBA` = round(BA - xBA, 3),
+    SLG = round(sum(Bases) / sum(AtBats), 3),  # Calculate SLG based on aggregated At Bats and Bases
+    xSLG = round(mean(xSLG), 3),
+    `SLG - xSLG` = round(SLG - xSLG, 3)
+  ) %>%
+  arrange(desc(`At Bats`))
+
+# Replace abbreviations with full names
+final_expected <- expected_stats %>%
+  mutate(Team = recode(Team, !!!team_lookup))
+
+qualified = filter(final_expected, `At Bats` >= min_ab)
+
+table_html <- kable(qualified, format = "html") %>%
+  kable_styling() %>%
+  row_spec(which(qualified$`BA - xBA` > .02 & qualified$`SLG - xSLG` > 0.05), bold = TRUE, color = "white", background = "red") %>%
+  row_spec(which(qualified$`BA - xBA` <= 0 & qualified$`SLG - xSLG` <= 0), bold = TRUE, color = "white", background = "green")
+
+html_table <- as.character(table_html)
+
+full_html <- tags$html(
+  tags$body(
+    tags$h1(paste("Cape League Expected Stats (min ", min_ab, "BF)")),
+    tags$h2("With all available Trackman Data"),
+    tags$p("Red: xBA over .020 greater than BA and xSLG over .050 greater than SLG", tags$br(),
+               "Green: xBA less than BA and xSLG less than SLG", tags$br(), 
+               "White: Does not fit either criteria"),
+    HTML(html_table)
+  )
+)
+
+save_html <- function(html, file) {
+  writeLines(as.character(html), file)
+}
+
+save_html(full_html, file = "all_league_expected_hitters.html")
+```
+##Plot BA
+```{r}
+# Create the plot
+plot_data = qualified
+ba_threshold <- 0.08
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data$ba_performance <- with(plot_data, ifelse(BA - xBA > ba_threshold, "Overperforming",
+                              ifelse(BA - xBA < -ba_threshold, "Underperforming", "Normal")))
+plot_data$ba_label <- ifelse(plot_data$ba_performance != "Normal", plot_data$Batter, NA)
+
+# Create the plot
+ggplot(plot_data, aes(x = BA, y = xBA, color = ba_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Batting Average vs Expected Batting Average",
+       x = "Batting Average (BA)",
+       y = "Expected Batting Average (xBA)",
+       subtitle = paste0("Minumum At Bats: ", min_ab, ", Colored if residual is >= ", ba_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+## BA Residuals
+```{r}
+plot_data$ba_residual <- plot_data$BA - plot_data$xBA
+# Define the threshold for extreme cases
+ba_threshold <- 0.08
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data$ba_performance <- with(plot_data, ifelse(ba_residual > ba_threshold, "Overperforming",
+                              ifelse(ba_residual < -ba_threshold, "Underperforming", "Normal")))
+plot_data$ba_label <- ifelse(plot_data$ba_performance != "Normal", plot_data$Batter, NA)
+
+# Create the residuals plot
+ggplot(plot_data, aes(x = xBA, y = ba_residual, color = ba_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +  # Add the horizontal line at 0
+  labs(title = "Expected Batting Average vs Residuals of Batting Average",
+       x = "Expected Batting Average (xBA)",
+       y = "Residuals (BA - xBA)",
+       subtitle = paste0("Minumum At Bats: ", min_ab, ", Colored if residual is >= ", ba_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+```
+##Plot SLG
+```{r}
+# Define the threshold for extreme cases
+slg_threshold <- 0.12
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data$slg_performance <- with(plot_data, ifelse(SLG - xSLG > slg_threshold, "Overperforming",
+                              ifelse(SLG - xSLG < -slg_threshold, "Underperforming", "Normal")))
+plot_data$slg_label <- ifelse(plot_data$slg_performance != "Normal", plot_data$Batter, NA)
+
+# Create the plot
+ggplot(plot_data, aes(x = SLG, y = xSLG, color = slg_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Slugging Percentage vs Expected Slugging Percentage",
+       x = "Slugging Percentage (SLG)",
+       y = "Expected Slugging Percentage (xSLG)",
+       subtitle = paste0("Minumum At Bats: ", min_ab, ", Colored if residual is >= ", slg_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+## SLG Residuals
+```{r}
+plot_data$slg_residual <- plot_data$SLG - plot_data$xSLG
+# Define the threshold for extreme cases
+slg_threshold <- 0.12
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data$slg_performance <- with(plot_data, ifelse(slg_residual > slg_threshold, "Overperforming",
+                              ifelse(slg_residual < -slg_threshold, "Underperforming", "Normal")))
+plot_data$slg_label <- ifelse(plot_data$slg_performance != "Normal", plot_data$Batter, NA)
+
+# Create the residuals plot
+ggplot(plot_data, aes(x = xSLG, y = slg_residual, color = slg_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +  # Add the horizontal line at 0
+  labs(title = "Expected Slugging Percentage vs Residuals of Slugging Percentage",
+       x = "Expected Slugging Percentage (xSLG)",
+       y = "Residuals (SLG - xSLG)",
+       subtitle = paste0("Minumum At Bats: ", min_ab, ", Colored if residual is >= ", slg_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+```
+
+
+## PITCHERS
+##HTML Output
+```{r}
+min_bf = 50
+
+# Group by 'Pitcher' and 'PitcherTeam' and calculate averages
+aggregated_data_pitchers <- cape_final_no_na %>%
+  group_by(Pitcher, PitcherTeam) %>%
+  summarize(
+    IsHit = sum(IsHit, na.rm = TRUE),  # Sum IsHit, ignoring NA values
+    Bases = sum(Bases, na.rm = TRUE),  # Sum Bases, ignoring NA values
+    xBA = mean(xBA, na.rm = TRUE),  # Mean of xBA, ignoring NA values
+    BA_minus_xBA = mean(BA_minus_xBA, na.rm = TRUE),  # Mean of BA_minus_xBA, ignoring NA values
+    xSLG = mean(xSLG, na.rm = TRUE),  # Mean of xSLG, ignoring NA values
+    SLG_minus_xSLG = mean(SLG_minus_xSLG, na.rm = TRUE),  # Mean of SLG_minus_xSLG, ignoring NA values
+    AtBats = n()
+  ) %>%
+  ungroup()
+
+# Now summarize the aggregated data
+expected_stats_pitchers <- aggregated_data_pitchers %>%
+  group_by(Pitcher) %>%
+  summarize(
+    Team = first(PitcherTeam),
+    `Batters Faced` = sum(AtBats),
+    Hits = sum(IsHit),
+    Bases = sum(Bases),
+    BA = round(sum(IsHit) / sum(AtBats), 3),
+    xBA = round(mean(xBA), 3),
+    `BA - xBA` = round(BA - xBA, 3),
+    SLG = round(sum(Bases) / sum(AtBats), 3),  # Calculate SLG based on aggregated At Bats and Bases
+    xSLG = round(mean(xSLG), 3),
+    `SLG - xSLG` = round(SLG - xSLG, 3)
+  ) %>%
+  arrange(desc(`Batters Faced`))
+
+# Replace abbreviations with full names
+final_expected_pitchers <- expected_stats_pitchers %>%
+  mutate(Team = recode(Team, !!!team_lookup))
+
+qualified_pitchers = filter(final_expected_pitchers, `Batters Faced` >= min_bf)
+
+table_html_pitchers <- kable(qualified_pitchers, format = "html") %>%
+  kable_styling() %>%
+  row_spec(which(qualified_pitchers$`BA - xBA` > 0 & qualified_pitchers$`SLG - xSLG` > 0), bold = TRUE, color = "white", background = "green") %>%
+  row_spec(which(qualified_pitchers$`BA - xBA` <= .02 & qualified_pitchers$`SLG - xSLG` <= 0.05), bold = TRUE, color = "white", background = "red")
+
+html_table_pitchers <- as.character(table_html_pitchers)
+
+full_html_pitchers <- tags$html(
+  tags$body(
+    tags$h1(paste("Cape League Expected Stats (min ", min_bf, "BF)")),
+    tags$h2("With all available Trackman Data"),
+    tags$p("Green: xBAA over .020 greater than BAA and xSLGA over .050 greater than SLGA", tags$br(),
+               "Red: xBAA less than BAA and xSLGA less than SLGA", tags$br(), 
+               "White: Does not fit either criteria"),
+    HTML(html_table_pitchers)
+  )
+)
+
+save_html <- function(html, file) {
+  writeLines(as.character(html), file)
+}
+
+save_html(full_html_pitchers, file = "all_league_expected_pitchers.html")
+```
+##Plot BAA
+```{r}
+# Create the plot
+plot_data_pitchers = qualified_pitchers
+# Define the threshold for extreme cases
+ba_threshold_pitchers <- 0.08
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data_pitchers$ba_performance <- with(plot_data_pitchers, ifelse(BA - xBA > ba_threshold_pitchers, "Underperforming",
+                              ifelse(BA - xBA < -ba_threshold_pitchers, "Overperforming", "Normal")))
+plot_data_pitchers$ba_label <- ifelse(plot_data_pitchers$ba_performance != "Normal", plot_data_pitchers$Pitcher, NA)
+
+# Create the plot
+ggplot(plot_data_pitchers, aes(x = BA, y = xBA, color = ba_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Batting Average Against vs Expected Batting Average Against",
+       x = "Batting Average (BAA)",
+       y = "Expected Batting Average (xBAA)",
+       subtitle = paste0("Minumum Batters Faced: ", min_bf, ", Colored if residual is >= ", ba_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+## BAA residuals
+```{r}
+plot_data_pitchers$ba_residual_pitchers <- plot_data_pitchers$BA - plot_data_pitchers$xBA
+
+ba_threshold_pitchers <- 0.08
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data_pitchers$ba_performance_pitchers <- with(plot_data_pitchers, ifelse(ba_residual_pitchers > ba_threshold_pitchers, "Underperforming",
+                              ifelse(ba_residual_pitchers < -ba_threshold_pitchers, "Overperforming", "Normal")))
+plot_data_pitchers$ba_label_pitchers <- ifelse(plot_data_pitchers$ba_performance_pitchers != "Normal", plot_data_pitchers$Pitcher, NA)
+
+# Create the residuals plot
+ggplot(plot_data_pitchers, aes(x = xBA, y = ba_residual_pitchers, color = ba_performance_pitchers)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label_pitchers), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +  # Add the horizontal line at 0
+  labs(title = "Expected Batting Average Against vs Residuals of Batting Average",
+       x = "Expected Batting Average (xBAA)",
+       y = "Residuals (BAA - xBAA)",
+       subtitle = paste0("Minumum Batters Faced: ", min_bf, ", Colored if residual is >= ", ba_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+##Plot SLGA
+```{r}
+# Define the threshold for extreme cases
+slg_threshold_pitchers <- 0.11
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data_pitchers$slg_performance <- with(plot_data_pitchers, ifelse(SLG - xSLG > slg_threshold_pitchers, "Underperforming",
+                              ifelse(SLG - xSLG < -slg_threshold_pitchers, "Overperforming", "Normal")))
+plot_data_pitchers$slg_label <- ifelse(plot_data_pitchers$slg_performance != "Normal", plot_data_pitchers$Pitcher, NA)
+
+# Create the plot
+ggplot(plot_data_pitchers, aes(x = SLG, y = xSLG, color = slg_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "SLG Percentage Against vs Expected SLG Percentage Against",
+       x = "Slugging Percentage (SLGA)",
+       y = "Expected Slugging Percentage (xSLGA)",
+      subtitle = paste0("Minumum Batters Faced: ", min_bf, ", Colored if residual is >= ", slg_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+## SLGA residuals
+```{r}
+plot_data_pitchers$slg_residual_pitchers <- plot_data_pitchers$SLG - plot_data_pitchers$xSLG
+
+slg_threshold_pitchers <- 0.11
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+plot_data_pitchers$slg_performance_pitchers <- with(plot_data_pitchers, ifelse(slg_residual_pitchers > slg_threshold_pitchers, "Underperforming",
+                              ifelse(slg_residual_pitchers < -slg_threshold_pitchers, "Overperforming", "Normal")))
+plot_data_pitchers$slg_label_pitchers <- ifelse(plot_data_pitchers$slg_performance_pitchers != "Normal", plot_data_pitchers$Pitcher, NA)
+
+# Create the residuals plot
+ggplot(plot_data_pitchers, aes(x = xSLG, y = slg_residual_pitchers, color = slg_performance_pitchers)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label_pitchers), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +  # Add the horizontal line at 0
+  labs(title = "Expected Slugging Percentage Against vs Slugging Residuals",
+       x = "Expected Slugging Percentage Against (xSLGA)",
+       y = "Residuals (SLGA - xSLGA)",
+       subtitle = paste0("Minumum Batters Faced: ", min_bf, ", Colored if residual is >= ", slg_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+## GATEMEN
+
+##Plot BA
+```{r}
+# Create the plot
+gatemen_data = filter(final_expected, Team == "Wareham Gatemen")
+ba_threshold <- 0.01
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+gatemen_data$ba_performance <- with(gatemen_data, ifelse(BA - xBA > ba_threshold, "Overperforming",
+                              ifelse(BA - xBA < -ba_threshold, "Underperforming", "Normal")))
+gatemen_data$ba_label <- ifelse(gatemen_data$ba_performance != "Normal", gatemen_data$Batter, NA)
+
+# Create the plot
+ggplot(gatemen_data, aes(x = BA, y = xBA, color = ba_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Gatemen Batting Average vs Expected Batting Average",
+       x = "Batting Average (BA)",
+       y = "Expected Batting Average (xBA)",
+       subtitle = paste0("Colored if residual is >= ", ba_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+##Plot SLG
+```{r}
+# Define the threshold for extreme cases
+slg_threshold <- 0.05
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+gatemen_data$slg_performance <- with(gatemen_data, ifelse(SLG - xSLG > slg_threshold, "Overperforming",
+                              ifelse(SLG - xSLG < -slg_threshold, "Underperforming", "Normal")))
+gatemen_data$slg_label <- ifelse(gatemen_data$slg_performance != "Normal", gatemen_data$Batter, NA)
+
+# Create the plot
+ggplot(gatemen_data, aes(x = SLG, y = xSLG, color = slg_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Gatemen Slugging Percentage vs Expected Slugging Percentage",
+       x = "Slugging Percentage (SLG)",
+       y = "Expected Slugging Percentage (xSLG)",
+       subtitle = paste0("Colored if residual is >= ", slg_threshold),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+##Plot BAA
+```{r}
+# Create the plot
+gatemen_pitchers = filter(final_expected_pitchers, Team == "Wareham Gatemen")
+# Define the threshold for extreme cases
+ba_threshold_pitchers <- 0.05
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+gatemen_pitchers$ba_performance <- with(gatemen_pitchers, ifelse(BA - xBA > ba_threshold_pitchers, "Underperforming",
+                              ifelse(BA - xBA < -ba_threshold_pitchers, "Overperforming", "Normal")))
+gatemen_pitchers$ba_label <- ifelse(gatemen_pitchers$ba_performance != "Normal", gatemen_pitchers$Pitcher, NA)
+
+# Create the plot
+ggplot(gatemen_pitchers, aes(x = BA, y = xBA, color = ba_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = ba_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Gatemen Batting Average Against vs Expected BAA",
+       x = "Batting Average (BAA)",
+       y = "Expected Batting Average (xBAA)",
+       subtitle = paste0("Colored if residual is >= ", ba_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+##Plot SLGA
+```{r}
+# Define the threshold for extreme cases
+slg_threshold_pitchers <- 0.05
+
+# Create new columns to identify overperforming and underperforming cases and their labels
+gatemen_pitchers$slg_performance <- with(gatemen_pitchers, ifelse(SLG - xSLG > slg_threshold_pitchers, "Underperforming",
+                              ifelse(SLG - xSLG < -slg_threshold_pitchers, "Overperforming", "Normal")))
+gatemen_pitchers$slg_label <- ifelse(gatemen_pitchers$slg_performance != "Normal", gatemen_pitchers$Pitcher, NA)
+
+# Create the plot
+ggplot(gatemen_pitchers, aes(x = SLG, y = xSLG, color = slg_performance)) +
+  geom_point(size = 3) +  # Add points
+  geom_text_repel(aes(label = slg_label), size = 3, na.rm = TRUE) +  # Add labels for extreme cases without overlap
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +  # Add the line
+  labs(title = "Gatemen SLG Percentage Against vs Expected SLG Percentage Against",
+       x = "Slugging Percentage (SLGA)",
+       y = "Expected Slugging Percentage (xSLGA)",
+      subtitle = paste0("Colored if residual is >= ", slg_threshold_pitchers),
+       color = "Performance") +
+  scale_color_manual(values = c("Underperforming" = "darkgreen", "Overperforming" = "red", "Normal" = "gray")) +  # Set colors for overperforming, underperforming, and normal 
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
